@@ -6,8 +6,11 @@ import {
   Send, Award, BookOpen, Layers, Sliders, ChevronRight,
   Check, AlertCircle, Coffee, Brain, Key, Save, Download, X, Volume2,
   Activity, Dumbbell, Heart, UserCheck, BookMarked, Edit3, Filter,
-  BarChart3, Settings, Smile, BatteryCharging, Tag, LayoutGrid, CheckSquare, FileText
+  BarChart3, Settings, Smile, BatteryCharging, Tag, LayoutGrid, CheckSquare, FileText,
+  LogIn, LogOut, Cloud
 } from 'lucide-react';
+import { supabase, isSupabaseConfigured } from './lib/supabase';
+import AuthPage from './components/AuthPage';
 
 // ============================================================================
 // CONSTANTS & STORAGE KEYS
@@ -135,7 +138,6 @@ function formatDateTimeStamp(isoOrDate = new Date()) {
 function buildHeatmapGrid(weeksCount = 20) {
   const today = new Date();
   const todayISO = getISODate(today);
-  // Align end of last column to end of current week (Saturday)
   const dayOfWeek = today.getDay(); // 0 (Sun) .. 6 (Sat)
   const endOfGrid = new Date(today);
   endOfGrid.setDate(today.getDate() + (6 - dayOfWeek));
@@ -163,7 +165,7 @@ function buildHeatmapGrid(weeksCount = 20) {
   return columns;
 }
 
-// Generate realistic initial historical completions when optional demo seeding is enabled
+// Generate optional historical completions when demo seeding is explicitly enabled
 function seedHistoryForId(idStr) {
   let hash = 0;
   for (let i = 0; i < idStr.length; i++) {
@@ -171,7 +173,6 @@ function seedHistoryForId(idStr) {
   }
   const history = {};
   const today = new Date();
-  // Seed past 45 days with a realistic clustered pattern
   for (let offset = 1; offset <= 45; offset++) {
     const d = new Date(today);
     d.setDate(today.getDate() - offset);
@@ -190,7 +191,6 @@ function calculateStreakFromHistory(historyMap = {}) {
   const today = new Date();
   let streak = 0;
   const cursor = new Date(today);
-  // If today is not yet ticked, start checking from yesterday so active streak is preserved
   if (!historyMap[getISODate(cursor)]) {
     cursor.setDate(cursor.getDate() - 1);
   }
@@ -453,7 +453,7 @@ export default function App() {
   const todayISO = useMemo(() => getISODate(new Date()), []);
   const heatmapColumns = useMemo(() => buildHeatmapGrid(22), []);
 
-  // Load persisted state if available
+  // Load persisted local state if available
   const savedState = useMemo(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -462,6 +462,13 @@ export default function App() {
       return null;
     }
   }, []);
+
+  // Supabase Auth & Cloud Sync State
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(!isSupabaseConfigured);
+  const [guestMode, setGuestMode] = useState(false);
+  const [isCloudHydrated, setIsCloudHydrated] = useState(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('idle'); // 'idle' | 'syncing' | 'synced' | 'error'
 
   // Navigation & Wizard State (Steps 1 to 5)
   const [currentStep, setCurrentStep] = useState(savedState?.currentStep || 1);
@@ -510,7 +517,6 @@ export default function App() {
 
   // Step 5: Worksheet, HabitKit Heatmap History & Journals
   const [worksheet, setWorksheet] = useState(savedState?.worksheet || null);
-  // Map of itemId -> { [YYYY-MM-DD]: boolean }
   const [completionHistory, setCompletionHistory] = useState(savedState?.completionHistory || {});
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState('All');
   const [activeView, setActiveView] = useState('heatmap'); // 'heatmap' | 'timeline' | 'journals'
@@ -561,7 +567,7 @@ export default function App() {
   const [editingDraft, setEditingDraft] = useState(null);
   const [aiJournalInsight, setAiJournalInsight] = useState(savedState?.aiJournalInsight || null);
 
-  // Per-block inline quick journal notes (blockId -> array of timestamped mini-notes)
+  // Per-block inline quick journal notes
   const [blockNotes, setBlockNotes] = useState(savedState?.blockNotes || {});
   const [activeBlockNoteInput, setActiveBlockNoteInput] = useState({});
 
@@ -572,7 +578,69 @@ export default function App() {
   const [timerMode, setTimerMode] = useState('focus');
   const [focusSessionsCompleted, setFocusSessionsCompleted] = useState(savedState?.focusSessionsCompleted || 0);
 
-  // Safe Step Recovery Guard: prevent blank screen if localStorage has Step 4/5 without data
+  // 1. Listen for Supabase auth state
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return;
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session ?? null);
+      setAuthChecked(true);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession ?? null);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  // 2. Load saved user state from Supabase after sign-in
+  useEffect(() => {
+    if (!session?.user || !supabase) {
+      setIsCloudHydrated(false);
+      setCloudSyncStatus('idle');
+      return;
+    }
+
+    let cancelled = false;
+    setIsCloudHydrated(false);
+    setCloudSyncStatus('syncing');
+
+    supabase
+      .from('chronos_user_states')
+      .select('state')
+      .eq('user_id', session.user.id)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          setCloudSyncStatus('error');
+          setIsCloudHydrated(true);
+          return;
+        }
+        const s = data?.state;
+        if (s) {
+          if (s.currentStep) setCurrentStep(s.currentStep);
+          if (s.fixedSchedules) setFixedSchedules(s.fixedSchedules);
+          if (s.bioSchedule) setBioSchedule(s.bioSchedule);
+          if (s.goalsData) setGoalsData(s.goalsData);
+          if (s.moreAboutMe) setMoreAboutMe(s.moreAboutMe);
+          if (s.roadmap !== undefined) setRoadmap(s.roadmap);
+          if (s.refinementHistory) setRefinementHistory(s.refinementHistory);
+          if (s.worksheet !== undefined) setWorksheet(s.worksheet);
+          if (s.completionHistory) setCompletionHistory(s.completionHistory);
+          if (s.journals) setJournals(s.journals);
+          if (s.blockNotes) setBlockNotes(s.blockNotes);
+          if (s.aiJournalInsight !== undefined) setAiJournalInsight(s.aiJournalInsight);
+          if (s.focusSessionsCompleted !== undefined) setFocusSessionsCompleted(s.focusSessionsCompleted);
+        }
+        setCloudSyncStatus('synced');
+        setIsCloudHydrated(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.user?.id]);
+
+  // Safe Step Recovery Guard: prevent blank screen if state has Step 4/5 without data
   useEffect(() => {
     if (currentStep === 5 && !worksheet) {
       setCurrentStep(roadmap ? 4 : 3);
@@ -581,7 +649,7 @@ export default function App() {
     }
   }, [currentStep, roadmap, worksheet]);
 
-  // Persist state automatically
+  // Persist local state automatically
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
@@ -608,6 +676,40 @@ export default function App() {
     journals, blockNotes, aiJournalInsight, focusSessionsCompleted
   ]);
 
+  // 3. Debounced cloud auto-save to Supabase whenever state changes
+  useEffect(() => {
+    if (!session?.user || !supabase || !isCloudHydrated) return;
+    setCloudSyncStatus('syncing');
+    const timer = setTimeout(async () => {
+      const { error } = await supabase.from('chronos_user_states').upsert({
+        user_id: session.user.id,
+        state: {
+          currentStep,
+          fixedSchedules,
+          bioSchedule,
+          goalsData,
+          moreAboutMe,
+          roadmap,
+          refinementHistory,
+          worksheet,
+          completionHistory,
+          journals,
+          blockNotes,
+          aiJournalInsight,
+          focusSessionsCompleted
+        },
+        updated_at: new Date().toISOString()
+      });
+      setCloudSyncStatus(error ? 'error' : 'synced');
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [
+    session?.user?.id, isCloudHydrated,
+    currentStep, fixedSchedules, bioSchedule, goalsData, moreAboutMe,
+    roadmap, refinementHistory, worksheet, completionHistory,
+    journals, blockNotes, aiJournalInsight, focusSessionsCompleted
+  ]);
+
   // Pure Pomodoro Timer Countdown (separated from side effects for React 19 StrictMode safety)
   useEffect(() => {
     if (!isTimerRunning) return;
@@ -626,6 +728,14 @@ export default function App() {
       setFocusSessionsCompleted((c) => c + 1);
     }
   }, [timerSeconds, isTimerRunning, timerMode]);
+
+  const handleSignOut = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    setGuestMode(false);
+    setCloudSyncStatus('idle');
+  };
 
   const formatTimer = (totalSec) => {
     const mins = Math.floor(totalSec / 60);
@@ -1048,7 +1158,7 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
       tags,
       linkedTaskTitle: journalForm.linkedTaskTitle || 'General Daily Log',
       writtenAtISO: now.toISOString(),
-      journalDateLabel: formatDateTimeStamp(now), // Immutable original date stamp when written
+      journalDateLabel: formatDateTimeStamp(now),
       lastEditedLabel: null
     };
 
@@ -1092,7 +1202,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
         energyLevel: Number(editingDraft.energyLevel) || j.energyLevel,
         tags,
         linkedTaskTitle: editingDraft.linkedTaskTitle,
-        // Keep original journalDateLabel intact and record lastEditedLabel
         lastEditedLabel: formatDateTimeStamp(now)
       };
     }));
@@ -1119,7 +1228,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
       ...prev,
       [blockId]: [noteObj, ...(prev[blockId] || [])]
     }));
-    // Also mirror into main Everyday Journals feed so all reflections are unified
     setJournals(prev => [
       {
         id: `journal_block_${Date.now()}`,
@@ -1233,6 +1341,19 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
     { num: 5, label: 'Daily Tracker', icon: LayoutGrid }
   ];
 
+  // Auth Gate (placed after all hooks to satisfy React Rules of Hooks)
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen bg-[#09090d] text-slate-300 flex items-center justify-center text-sm">
+        Checking session...
+      </div>
+    );
+  }
+
+  if (isSupabaseConfigured && !session && !guestMode) {
+    return <AuthPage onGuestContinue={() => setGuestMode(true)} />;
+  }
+
   return (
     <div className="min-h-screen bg-[#09090d] text-slate-100 pb-28 font-sans selection:bg-indigo-500 selection:text-white">
       {/* =====================================================================
@@ -1259,8 +1380,27 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
             </div>
           </div>
 
-          {/* Right Action Icons (matching screenshot circular buttons) */}
+          {/* Right Action Icons */}
           <div className="flex items-center gap-2">
+            {isSupabaseConfigured && session && (
+              <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#16161f] border border-slate-800 text-[11px] text-slate-300">
+                <Cloud className={`w-3.5 h-3.5 ${
+                  cloudSyncStatus === 'synced'
+                    ? 'text-emerald-400'
+                    : cloudSyncStatus === 'error'
+                    ? 'text-rose-400'
+                    : 'text-amber-400'
+                }`} />
+                <span>
+                  {cloudSyncStatus === 'syncing'
+                    ? 'Syncing...'
+                    : cloudSyncStatus === 'error'
+                    ? 'Sync Error'
+                    : 'Cloud Synced'}
+                </span>
+              </div>
+            )}
+
             <button
               onClick={() => setShowMoreAboutMeModal(true)}
               className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-[#16161f] hover:bg-[#1f1f2b] text-indigo-300 border border-indigo-500/30 transition"
@@ -1290,6 +1430,28 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
             >
               <Key className="w-4 h-4" />
             </button>
+
+            {isSupabaseConfigured && (
+              session ? (
+                <button
+                  onClick={handleSignOut}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-[#16161f] hover:bg-rose-950/50 text-slate-300 hover:text-rose-200 border border-slate-800 transition"
+                  title={`Signed in as ${session.user.email}`}
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Sign Out</span>
+                </button>
+              ) : (
+                <button
+                  onClick={() => setGuestMode(false)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 transition"
+                  title="Sign in to sync your data"
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Sign In</span>
+                </button>
+              )
+            )}
 
             {currentStep === 5 && worksheet && (
               <button
@@ -1653,9 +1815,9 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
           </section>
         )}
 
-        {/* ================================================================
+        {/* =================================================================
             STEP 3: GOALS, TIMEFRAME & "MORE ABOUT ME" PERSONAL VARIABLES
-        ================================================================ */}
+        ================================================================= */}
         {currentStep === 3 && (
           <section className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -1951,9 +2113,9 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
           </section>
         )}
 
-        {/* ================================================================
+        {/* =================================================================
             STEP 4: AI RESEARCH & STRATEGIC ROADMAP
-        ================================================================ */}
+        ================================================================= */}
         {currentStep === 4 && roadmap && (
           <section className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -2072,9 +2234,9 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
           </section>
         )}
 
-        {/* ================================================================
+        {/* =================================================================
             STEP 5: HABITKIT-INSPIRED EVERYDAY INTERFACE + JOURNALS
-        ================================================================ */}
+        ================================================================= */}
         {currentStep === 5 && worksheet && (
           <section className="space-y-6">
             {/* Top Category Pills & Quick Stats Bar */}
@@ -2232,7 +2394,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                           key={habit.id}
                           className="p-5 rounded-[28px] bg-[#14141c] border border-slate-800/80 hover:border-slate-700/80 transition space-y-4 shadow-xl"
                         >
-                          {/* Top Row: Icon Badge + Title + Right Check Button */}
                           <div className="flex items-center justify-between gap-3">
                             <div className="flex items-center gap-3.5">
                               <div className={`w-12 h-12 rounded-2xl border flex items-center justify-center shrink-0 ${palette.iconBg}`}>
@@ -2248,7 +2409,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                               </div>
                             </div>
 
-                            {/* HabitKit-style Rounded Square Checkmark Button */}
                             <button
                               onClick={() => toggleDateCompletion(habit.id, todayISO)}
                               className={`w-12 h-12 rounded-2xl border flex items-center justify-center transition-all duration-200 shrink-0 ${
@@ -2262,7 +2422,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                             </button>
                           </div>
 
-                          {/* 7x22 Dot-Matrix Progress Heatmap Grid */}
                           <div className="overflow-x-auto pb-1">
                             <div className="inline-flex gap-[5px]">
                               {heatmapColumns.map((col, cIdx) => (
@@ -2320,7 +2479,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                           key={block.id}
                           className="p-5 rounded-[28px] bg-[#14141c] border border-slate-800/80 hover:border-slate-700/80 transition space-y-4 shadow-xl"
                         >
-                          {/* Card Header */}
                           <div className="flex items-center justify-between gap-3">
                             <div className="flex items-center gap-3.5 min-w-0">
                               <div className={`w-12 h-12 rounded-2xl border flex items-center justify-center shrink-0 ${palette.iconBg}`}>
@@ -2354,7 +2512,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                             </button>
                           </div>
 
-                          {/* Dot-Matrix Progress Grid */}
                           <div className="overflow-x-auto pb-1">
                             <div className="inline-flex gap-[5px]">
                               {heatmapColumns.map((col, cIdx) => (
@@ -2383,7 +2540,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                             </div>
                           </div>
 
-                          {/* Card Footer Actions: Micro-steps & Inline Journal Note */}
                           <div className="flex items-center justify-between pt-1 border-t border-slate-800/70 text-xs">
                             <div className="flex items-center gap-3">
                               <button
@@ -2409,7 +2565,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                             </button>
                           </div>
 
-                          {/* Expandable Micro-Steps + Per-Task Timestamped Journal */}
                           {isExpanded && (
                             <div className="pt-3 border-t border-slate-800/80 space-y-3">
                               {block.actionableMicroSteps?.length > 0 && (
@@ -2428,7 +2583,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                                 </div>
                               )}
 
-                              {/* Quick Task Journal Input */}
                               <div className="space-y-2 pt-1">
                                 <label className="block text-[11px] font-semibold text-slate-400">
                                   Add Timestamped Task Journal Note:
@@ -2708,7 +2862,7 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                     </button>
                   </form>
 
-                  {/* Saved Journals Timeline (Editable Anytime After) */}
+                  {/* Saved Journals Timeline */}
                   <div className="lg:col-span-7 space-y-3">
                     {journals.length === 0 ? (
                       <div className="p-8 rounded-3xl border border-dashed border-slate-800 text-center text-slate-500 text-sm">
@@ -2786,7 +2940,6 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
                                 </div>
                               </>
                             ) : (
-                              /* Edit Mode Form (Preserves original Written Date Stamp) */
                               <div className="space-y-3">
                                 <div className="flex items-center justify-between text-xs">
                                   <span className="font-mono text-indigo-300">
@@ -2904,7 +3057,7 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
       </main>
 
       {/* ========================================================
-          "MORE ABOUT ME" GLOBAL MODAL (ACCESSIBLE FROM ANY STEP)
+          "MORE ABOUT ME" GLOBAL MODAL
       ======================================================== */}
       {showMoreAboutMeModal && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
@@ -3011,7 +3164,7 @@ Synthesize a research-backed Strategic Roadmap using behavioral psychology (Atom
       )}
 
       {/* ========================================================
-          ADD CUSTOM TASK / HABIT CARD MODAL (`+` BUTTON IN TOP BAR)
+          ADD CUSTOM TASK / HABIT CARD MODAL
       ======================================================== */}
       {showAddCustomTaskModal && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
