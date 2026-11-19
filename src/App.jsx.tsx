@@ -13,8 +13,8 @@ const SUPABASE_SESSION_STORAGE = "chronos_supabase_session_v1";
 
 // Paste your public Supabase project URL & Anon Key here (protected by RLS),
 // or expose them on window.__CHRONOS_ENV__ in index.html.
-const SUPABASE_URL_CONFIG = "";
-const SUPABASE_ANON_KEY_CONFIG = "";
+const SUPABASE_URL_CONFIG = 'https://YOUR_PROJECT_REF.supabase.co';
+const SUPABASE_ANON_KEY_CONFIG = 'YOUR_ANON_PUBLIC_KEY';
 
 // ... existing code ...
 // ============================================================================
